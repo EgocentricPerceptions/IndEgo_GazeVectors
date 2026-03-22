@@ -66,4 +66,3 @@ finally:
     cap.release()
     out.release()
     print("Video rendered with decisive smoothing. ")
-
