@@ -3,34 +3,31 @@ import pandas as pd
 import numpy as np
 
 # 1. SETUP
-video_input = 'User_14_Short_10.mp4'  # Ensure your video file is in the same folder
+video_input = 'User_14_Short_10.mp4'
 csv_input = 'general_eye_gaze.csv'
-video_output = 'gaze_smooth_overlay.mp4'
+video_output = 'gaze_fisheye_fixed.mp4'
 
-# 2. LOAD & PREPARE DATA
+# 2. LOAD DATA
 df = pd.read_csv(csv_input)
-
-# Calculate positions in meters
-df['avg_yaw'] = (df['left_yaw_rads_cpf'] + df['right_yaw_rads_cpf']) / 2
-df['g_x'] = np.sin(df['avg_yaw']) * np.cos(df['pitch_rads_cpf']) * df['depth_m']
-df['g_y'] = np.sin(df['pitch_rads_cpf']) * df['depth_m']
 
 # 3. VIDEO SPECS
 cap = cv2.VideoCapture(video_input)
 fps = cap.get(cv2.CAP_PROP_FPS)
-w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 out = cv2.VideoWriter(video_output, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
 
-# Conversion Factors
-px_m_x, px_m_y = w / 0.5, h / 0.4
+# --- FISHEYE CALIBRATION PARAMETERS ---
+# Adjust these if the dot doesn't reach the edges correctly
+FISHEYE_FOV_DEG = 130
+center_x, center_y = w // 2, h // 2
+# Calculate focal length in pixels based on the diagonal FOV
+diag_px = np.sqrt(w**2 + h**2)
+f_px = (diag_px / 2) / np.radians(FISHEYE_FOV_DEG / 2)
 
-# 4. FILTERING VARIABLES
-curr_x, curr_y = w // 2, h // 2
-disp_x, disp_y = w // 2, h // 2  # This is the "displayed" smooth position
-
-# Tweak these to your liking:
-alpha = 0.12        # Smoothness (lower = more fluid/slower, higher = snappier)
-deadzone_px = 30    # Minimum pixel jump required to trigger a move
+# Smoothing variables
+alpha = 0.15        # Movement fluidity (0.0 to 1.0)
+disp_x, disp_y = center_x, center_y
 
 frame_idx = 0
 try:
@@ -38,26 +35,41 @@ try:
         ret, frame = cap.read()
         if not ret: break
 
-        # Match Video frame to CSV timestamp
+        # Sync CSV row to Frame
         cur_us = (frame_idx / fps) * 1e6 + df['tracking_timestamp_us'].iloc[0]
         row = df.iloc[(df['tracking_timestamp_us'] - cur_us).abs().idxmin()]
 
-        # Target Pixel Position
-        tgt_x = int(w/2 + (row['g_x'] * px_m_x))
-        tgt_y = int(h/2 - (row['g_y'] * px_m_y))
+        # Get angles
+        yaw = row['avg_yaw'] if 'avg_yaw' in row else (row['left_yaw_rads_cpf'] + row['right_yaw_rads_cpf'])/2
+        pitch = row['pitch_rads_cpf']
 
-        # DEADZONE: Only update 'curr' if change is significant
-        dist = np.sqrt((tgt_x - curr_x)**2 + (tgt_y - curr_y)**2)
-        if dist > deadzone_px:
-            curr_x, curr_y = tgt_x, tgt_y
+        # --- FISHEYE PROJECTION LOGIC ---
+        # 1. Theta is the total angular deviation from the center axis
+        # cos(theta) = cos(yaw) * cos(pitch)
+        cos_theta = np.cos(yaw) * np.cos(pitch)
+        cos_theta = np.clip(cos_theta, -1.0, 1.0)
+        theta = np.arccos(cos_theta)
 
-        # INTERPOLATION: Move the displayed dot smoothly toward 'curr'
-        disp_x += (curr_x - disp_x) * alpha
-        disp_y += (curr_y - disp_y) * alpha
+        # 2. Radial distance from center in pixels (Equidistant model: r = f * theta)
+        r = f_px * theta
 
-        # Draw the Gaze Dot
-        cv2.circle(frame, (int(disp_x), int(disp_y)), 20, (0, 0, 255), -1)
-        cv2.circle(frame, (int(disp_x), int(disp_y)), 22, (255, 255, 255), 3)
+        # 3. Projection direction (using the ratio of yaw and pitch)
+        # We use arctan2 to find the 2D angle of the gaze on the image sensor
+        phi = np.arctan2(yaw, pitch)
+
+        # 4. Convert polar (r, phi) to Cartesian (x, y)
+        # Note: We subtract from pitch because in images, Y increases downwards
+        tgt_x = center_x + (r * np.sin(phi))
+        tgt_y = center_y - (r * np.cos(phi))
+
+        # --- SMOOTHING ---
+        disp_x += (tgt_x - disp_x) * alpha
+        disp_y += (tgt_y - disp_y) * alpha
+
+        # Draw Output
+        # Red center, White border for visibility
+        cv2.circle(frame, (int(disp_x), int(disp_y)), 18, (0, 0, 255), -1)
+        cv2.circle(frame, (int(disp_x), int(disp_y)), 20, (255, 255, 255), 2)
 
         out.write(frame)
         frame_idx += 1
@@ -65,4 +77,4 @@ try:
 finally:
     cap.release()
     out.release()
-    print("Video rendered with decisive smoothing. ")
+    print(f"Render Complete. Saved to {video_output}")
