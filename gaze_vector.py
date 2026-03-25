@@ -89,21 +89,21 @@ try:
         current_pos = (int(disp_x), int(disp_y))
         path_history.append(current_pos)
 
-        # 1. Create a single-point heat mask for the current gaze position
+        # 1.Create a single-point heat mask for the current gaze position
         point_mask = np.zeros((h, w), dtype=np.float32)
         cv2.circle(point_mask, current_pos, hm_kernel_size // 2, (hm_intensity), -1)
         point_mask = cv2.GaussianBlur(point_mask, (hm_kernel_size | 1, hm_kernel_size | 1), hm_sigma)
 
-        # 2. Add current heat to the accumulation buffer and apply decay
+        # 2.Add current heat to the accumulation buffer and apply decay
         heatmap_accum = cv2.add(heatmap_accum, point_mask)
         heatmap_accum *= hm_decay
 
-        # 3. Convert accumulation buffer to a visible 8-bit color map
+        # 3.Convert accumulation buffer to a visible 8-bit color map
         heatmap_norm = np.clip(heatmap_accum, 0, 1) * 255
         heatmap_norm = heatmap_norm.astype(np.uint8)
         heatmap_color = cv2.applyColorMap(heatmap_norm, cv2.COLORMAP_JET)
 
-        # 4. Blend the heatmap with the original frame
+        # 4.Blend the heatmap with the original frame
         frame = cv2.addWeighted(frame, 1.0, heatmap_color, hm_alpha, 0)
 
         # SCANPATH
