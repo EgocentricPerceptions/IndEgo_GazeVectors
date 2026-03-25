@@ -1,102 +1,124 @@
 import cv2
 import pandas as pd
 import numpy as np
-from scipy.optimize import minimize
+from collections import deque
 
 video_input = 'User_15_Short_10.mp4'
 csv_input = 'general_eye_gaze.csv'
-video_output = 'AUTO_FIXATION_CALIBRATED.mp4'
+video_output = 'FINAL_HEATMAP_SCANPATH14.mp4'
 
-#choosing the middle 1920x1640
-TARGET_X, TARGET_Y = 960, 820
-
-
-#we find the point in the video where we have the longest fixation (we found that also in the data analysis step) and
-#in that interval
-def find_best_fixation(df, window_seconds=1.5, search_limit_sec=30):
-
-    fps_data = 1 / (df['tracking_timestamp_us'].diff().mean() / 1e6)
-    window_size = int(window_seconds * fps_data)
-    search_limit_idx = int(search_limit_sec * fps_data)
-
-    best_idx = 0
-    min_dispersion = float('inf')
-
-    # Calculate STD
-    for i in range(0, search_limit_idx - window_size):
-        window = df.iloc[i: i + window_size]
-        #calculate the average
-        dispersion = window[['left_yaw_rads_cpf', 'right_yaw_rads_cpf', 'pitch_rads_cpf']].std().mean()
-
-        if dispersion < min_dispersion:
-            min_dispersion = dispersion
-            best_idx = i
-
-    start_time = (df.iloc[best_idx]['tracking_timestamp_us'] - df['tracking_timestamp_us'].iloc[0]) / 1e6
-    print(f"Fixation (optimum/longest) starts at: {start_time:.2f} (Stability: {min_dispersion:.4f})")
-    return best_idx, window_size
-
-
-#We have an egocentric perception so we need to inverse the y axis for our projection
-def get_projection(params, yaw, pitch, w, h):
-    v_fx, v_fy, v_offx, v_offy = params
-    X = np.cos(pitch) * np.sin(yaw)
-    Y = np.sin(pitch)
-    Z = np.cos(pitch) * np.cos(yaw)
-    if abs(Z) < 1e-6: Z = 1e-6
-
-    px = v_fx * (X / Z) + (w / 2) + v_offx
-    py = (h / 2) - (v_fy * (Y / Z)) + v_offy
-    return px, py
-
-
-#A manual calibration is not optimal, so we use the data from where we have found the interval for the optimal fixation
-#and choose our calibration interval
+#loading data
 df = pd.read_csv(csv_input)
-cap = cv2.VideoCapture(video_input)
-w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-fps_vid = cap.get(cv2.CAP_PROP_FPS)
 
-start_idx, w_size = find_best_fixation(df)
-calib_data = df.iloc[start_idx: start_idx + w_size]
-
-avg_yaw = (calib_data['left_yaw_rads_cpf'] + calib_data['right_yaw_rads_cpf']).mean() / 2
-avg_pitch = calib_data['pitch_rads_cpf'].mean()
-
-
-#Optimization -performs a constrained optimization to align the projected gaze with the target area
-def objective(p):
-    px, py = get_projection(p, avg_yaw, avg_pitch, w, h)
-    return (px - TARGET_X) ** 2 + (py - TARGET_Y) ** 2
-
-
-res = minimize(objective, [900, 900, 0, 400], method='L-BFGS-B',
-               bounds=[(600, 1500), (600, 1500), (-300, 300), (100, 800)])
-f_x, f_y, o_x, o_y = res.x
-
-#Generating end video
+#video specifications
+cap = cv2.VideoCapture(video_input) #we capture the video and open it in video_imput to process frame by frame
+fps_vid = cap.get(cv2.CAP_PROP_FPS) #we make sure that the processed video has the same speed-fps-as the original
+#we determine the dimension in pixels - openCv resturns a float so we use a wrapper to int
+w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+#param needed: the output, fourcc = four parameter code - for mp4 format, fps, dimension in pixels
 out = cv2.VideoWriter(video_output, cv2.VideoWriter_fourcc(*'mp4v'), fps_vid, (w, h))
-smooth_x, smooth_y = w // 2, h // 2
 
-while cap.isOpened():
-    ret, frame = cap.read()
-    if not ret: break
+#CALIBRATION & LENS - with manual calibration
+#transforming the coordinates from 2d in 3d
+FISHEYE_FOV_DEG = 125
+PITCH_CORRECTION = 0.165
+YAW_CORRECTION = 0.12
 
-    f_num = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
-    cur_us = (f_num / fps_vid) * 1e6 + df['tracking_timestamp_us'].iloc[0]
-    row = df.iloc[(df['tracking_timestamp_us'] - cur_us).abs().idxmin()]
+#the optic trajectory is build with the premise that (0,0,0) is equivalent to the center of the video frame
+center_x, center_y = w // 2, h // 2
+diag_px = np.sqrt(w ** 2 + h ** 2)
+f_px = (diag_px / 2) / np.radians(FISHEYE_FOV_DEG / 2)
 
-    rx, ry = get_projection([f_x, f_y, o_x, o_y],
-                            (row['left_yaw_rads_cpf'] + row['right_yaw_rads_cpf']) / 2,
-                            row['pitch_rads_cpf'], w, h)
+#heatmap config
+heatmap_accum = np.zeros((h, w), dtype=np.float32)
 
-    smooth_x += (np.clip(rx, 0, w - 1) - smooth_x) * 0.15
-    smooth_y += (np.clip(ry, 0, h - 1) - smooth_y) * 0.15
+hm_kernel_size = 80    # Size of the "heat" spot. Larger = blurrier/wider areas.
+hm_sigma = 25          # STD. Higher = smoother edges.
+hm_decay = 0.99        # Temporal decay (0.0 to 1.0)
+hm_intensity = 0.6
+hm_alpha = 0.4         # Transparency of the heatmap overlay
 
-    cv2.circle(frame, (int(smooth_x), int(smooth_y)), 10, (0, 0, 255), -1)
-    out.write(frame)
+#smoothing - we calculate the average on a queue of 5 frames
+avg_window = 5
+coord_buffer = deque(maxlen=avg_window)
+path_length = 25
+path_history = deque(maxlen=path_length)
 
-cap.release()
-out.release()
-print(f"Finalized process now, with the next parameters for best fixation: fx={f_x:.1f}, fy={f_y:.1f}, offset_y={o_y:.1f}")
+alpha_slow = 0.15
+alpha_fast = 0.85 #for adaptive smoothing
+saccade_threshold = 60
+
+#initializing positions
+disp_x, disp_y = float(center_x), float(center_y)
+frame_idx = 0
+
+try:
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret: break
+
+        #sync CSV to Video
+        cur_us = (frame_idx / fps_vid) * 1e6 + df['tracking_timestamp_us'].iloc[0]
+        row = df.iloc[(df['tracking_timestamp_us'] - cur_us).abs().idxmin()]
+
+        #raw gaze math
+        yaw = ((row['left_yaw_rads_cpf'] + row['right_yaw_rads_cpf']) / 2) + YAW_CORRECTION
+        pitch = row['pitch_rads_cpf'] + PITCH_CORRECTION
+
+        #fisheye Projection
+        cos_theta = np.cos(yaw) * np.cos(pitch)
+        cos_theta = np.clip(cos_theta, -1.0, 1.0)
+        theta = np.arccos(cos_theta)
+        r = f_px * theta
+        phi = np.arctan2(yaw, pitch)
+
+        raw_x = center_x + (r * np.sin(phi))
+        raw_y = center_y - (r * np.cos(phi))
+
+        #moving average
+        coord_buffer.append((raw_x, raw_y))
+        tgt_x = np.mean([p[0] for p in coord_buffer])
+        tgt_y = np.mean([p[1] for p in coord_buffer])
+
+        #adaptive smoothing
+        dist = np.sqrt((tgt_x - disp_x) ** 2 + (tgt_y - disp_y) ** 2)
+        alpha = alpha_fast if dist > saccade_threshold else alpha_slow
+        disp_x += (tgt_x - disp_x) * alpha
+        disp_y += (tgt_y - disp_y) * alpha
+
+        current_pos = (int(disp_x), int(disp_y))
+        path_history.append(current_pos)
+
+        # 1. Create a single-point heat mask for the current gaze position
+        point_mask = np.zeros((h, w), dtype=np.float32)
+        cv2.circle(point_mask, current_pos, hm_kernel_size // 2, (hm_intensity), -1)
+        point_mask = cv2.GaussianBlur(point_mask, (hm_kernel_size | 1, hm_kernel_size | 1), hm_sigma)
+
+        # 2. Add current heat to the accumulation buffer and apply decay
+        heatmap_accum = cv2.add(heatmap_accum, point_mask)
+        heatmap_accum *= hm_decay
+
+        # 3. Convert accumulation buffer to a visible 8-bit color map
+        heatmap_norm = np.clip(heatmap_accum, 0, 1) * 255
+        heatmap_norm = heatmap_norm.astype(np.uint8)
+        heatmap_color = cv2.applyColorMap(heatmap_norm, cv2.COLORMAP_JET)
+
+        # 4. Blend the heatmap with the original frame
+        frame = cv2.addWeighted(frame, 1.0, heatmap_color, hm_alpha, 0)
+
+        # SCANPATH
+        for i in range(1, len(path_history)):
+            thick = int(max(1, (i / path_length) * 4))
+            cv2.line(frame, path_history[i - 1], path_history[i], (0, 255, 255), thick)
+
+        #draw Current Gaze Point
+        cv2.circle(frame, current_pos, 10, (255, 255, 255), 2)
+        cv2.circle(frame, current_pos, 6, (0, 0, 255), -1)
+
+        out.write(frame)
+        frame_idx += 1
+
+finally:
+    cap.release()
+    out.release()
+    print(f"Process finished. Output saved as: {video_output}")
