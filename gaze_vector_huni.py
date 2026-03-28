@@ -2,108 +2,78 @@ import cv2
 import pandas as pd
 import numpy as np
 from collections import deque
+from projectaria_tools.core import data_provider
 
-# SETUP
-video_input = 'User_14_Short_10.mp4'
+vrs_path = "User_15_Short_10.vrs"
+provider = data_provider.create_vrs_data_provider(vrs_path)
+device_calib = provider.get_device_calibration()
+
+rgb_calib = device_calib.get_camera_calib("camera-rgb") or device_calib.get_camera_calib("device-rgb")
+if rgb_calib is None:
+    raise ValueError("RGB calibration not found")
+
+FX, FY = rgb_calib.get_focal_lengths()
+CX, CY = rgb_calib.get_principal_point()
+f_avg = (FX + FY) / 2
+
+video_input = 'User_15_Short_10.mp4'
 csv_input = 'general_eye_gaze.csv'
-video_output = 'FINAL_SMOOTH_SCANPATH14.mp4'
+video_output = 'PRECISION.mp4'
 
-# LOAD DATA
 df = pd.read_csv(csv_input)
-
-# VIDEO SPECS
 cap = cv2.VideoCapture(video_input)
-fps_vid = cap.get(cv2.CAP_PROP_FPS)
+fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
 w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-out = cv2.VideoWriter(video_output, cv2.VideoWriter_fourcc(*'mp4v'), fps_vid, (w, h))
+out = cv2.VideoWriter(video_output, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
 
-# --- CALIBRATION & LENS ---
-# Manual calibration to adjust errors in pitch and yaw
-# (The camera seems to be located on the top of the head and a bit to the left)
-FISHEYE_FOV_DEG = 125
-PITCH_CORRECTION = 0.165 # Add to move up
-YAW_CORRECTION = 0.12 # Add to move to the right
-
-# Calculates focal distance based on the Fisheye lens and the raw video
-center_x, center_y = w // 2, h // 2
-diag_px = np.sqrt(w ** 2 + h ** 2)
-f_px = (diag_px / 2) / np.radians(FISHEYE_FOV_DEG / 2)
-
-# SMOOTHING & SCANPATH CONFIG
-# Moving average buffer (higher = steadier but more lag)
-avg_window = 5
-coord_buffer = deque(maxlen=avg_window)
-
-# Scanpath history
-path_length = 25
-path_history = deque(maxlen=path_length)
-
-# Adaptive Smoothing Alpha
-alpha_slow = 0.15  # For fixations
-alpha_fast = 0.85  # For saccades (snapping)
-saccade_threshold = 60  # Pixels
-
-# INITIALIZE POSITIONS
-disp_x, disp_y = float(center_x), float(center_y)
+smooth_buffer = deque(maxlen=5)
+all_errors = []
 frame_idx = 0
+video_start_ts = df['tracking_timestamp_us'].iloc[0]
 
-try:
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret: break
+while cap.isOpened():
+    ret, frame = cap.read()
+    if not ret: break
 
-        # Sync CSV to Video
-        cur_us = (frame_idx / fps_vid) * 1e6 + df['tracking_timestamp_us'].iloc[0]
-        row = df.iloc[(df['tracking_timestamp_us'] - cur_us).abs().idxmin()]
+    cur_us = (frame_idx / fps) * 1e6 + video_start_ts
+    idx = (df['tracking_timestamp_us'] - cur_us).abs().idxmin()
+    row = df.iloc[idx]
 
-        # RAW GAZE MATH + Adding corrections
-        yaw = ((row['left_yaw_rads_cpf'] + row['right_yaw_rads_cpf']) / 2) + YAW_CORRECTION
-        pitch = row['pitch_rads_cpf'] + PITCH_CORRECTION
+    yaw = (row['left_yaw_rads_cpf'] + row['right_yaw_rads_cpf']) / 2
+    pitch = row['pitch_rads_cpf']
 
-        # Fisheye Projection
-        cos_theta = np.cos(yaw) * np.cos(pitch)
-        cos_theta = np.clip(cos_theta, -1.0, 1.0)
-        theta = np.arccos(cos_theta)
-        r = f_px * theta
-        phi = np.arctan2(yaw, pitch)
+    raw_x = CX + (FX * np.tan(yaw))
+    raw_y = CY - (FY * (np.tan(pitch) / np.cos(yaw)))
 
-        raw_x = center_x + (r * np.sin(phi))
-        raw_y = center_y - (r * np.cos(phi))
+    smooth_buffer.append((raw_x, raw_y))
+    avg_x, avg_y = int(np.mean([p[0] for p in smooth_buffer])), int(np.mean([p[1] for p in smooth_buffer]))
 
-        # MOVING AVERAGE (Primary Jitter Filter)
-        # In order to optimize the smoothnes we calculate the average movement for a certain number of frames
-        coord_buffer.append((raw_x, raw_y))
-        tgt_x = np.mean([p[0] for p in coord_buffer])
-        tgt_y = np.mean([p[1] for p in coord_buffer])
+    pixel_error = np.sqrt((raw_x - avg_x) ** 2 + (raw_y - avg_y) ** 2)
+    eroare_grade = np.degrees(np.arctan(pixel_error / f_avg))
+    all_errors.append(eroare_grade)
 
-        # ADAPTIVE SMOOTHING (Secondary Movement Filter) based on the magnitude of the jump
-        dist = np.sqrt((tgt_x - disp_x) ** 2 + (tgt_y - disp_y) ** 2)
+    accuracy_percent = max(0, 100 - (eroare_grade * 20))
 
-        # Decide how fast to follow the target
-        alpha = alpha_fast if dist > saccade_threshold else alpha_slow
+    cv2.putText(frame, f"Accuracy: {accuracy_percent:.1f}%", (50, 60),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+    cv2.putText(frame, f"Error: {eroare_grade:.2f} deg", (50, 100),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1)
 
-        disp_x += (tgt_x - disp_x) * alpha
-        disp_y += (tgt_y - disp_y) * alpha
+    cv2.circle(frame, (avg_x, avg_y), 15, (0, 0, 255), -1)
+    cv2.circle(frame, (avg_x, avg_y), 20, (255, 255, 255), 2)
 
-        # SCANPATH UPDATE - deciding current position based on the dispersion values above
-        current_pos = (int(disp_x), int(disp_y))
-        path_history.append(current_pos)
+    out.write(frame)
+    frame_idx += 1
 
-        # DRAWING
-        # Draw Scanpath Lines (Yellow)
-        for i in range(1, len(path_history)):
-            # Fade thickness for older segments
-            thick = int(max(1, (i / path_length) * 4))
-            cv2.line(frame, path_history[i - 1], path_history[i], (0, 255, 255), thick)
+    if frame_idx % 200 == 0:
+        print(f"Procesat cadru {frame_idx} Accuracy curent: {accuracy_percent:.1f}%")
 
-        # Draw Current Gaze Point (Red with White border)
-        cv2.circle(frame, current_pos, 20, (255, 255, 255), 2)
-        cv2.circle(frame, current_pos, 16, (0, 0, 255), -1)
+cap.release()
+out.release()
 
-        out.write(frame)
-        frame_idx += 1
-
-finally:
-    cap.release()
-    out.release()
-    print(f"Output: {video_output}")
+print("\n" + "=" * 30)
+print(f"Eroare medie: {np.mean(all_errors):.4f} grade")
+print(f"Accuracy mediu: {max(0, 100 - (np.mean(all_errors) * 20)):.2f}%")
+print(f"Video salvat: {video_output}")
+print("=" * 30)
+#filtered mi-a dat 95% mediu e pentru salturi
