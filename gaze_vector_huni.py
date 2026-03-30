@@ -3,77 +3,137 @@ import pandas as pd
 import numpy as np
 from collections import deque
 from projectaria_tools.core import data_provider
+import json
 
+
+def get_angular_corrections_from_jsonl(jsonl_path):
+    """
+    EXTRAGERE AUTOMATĂ 100%.
+    Extrage diferența de rotație dintre senzorii de ochi și camera RGB.
+    """
+    try:
+        with open(jsonl_path, 'r') as f:
+            first_line = f.readline()
+            data = json.loads(first_line)
+    except FileNotFoundError:
+        raise Exception(f"Eroare: Fișierul {jsonl_path} lipsește!")
+
+    slam_left_yaw = None
+    slam_left_pitch = None
+    rgb_yaw = None
+    rgb_pitch = None
+
+    for cam in data['CameraCalibrations']:
+        if cam['Label'] in ['camera-slam-left', 'camera-rgb']:
+            quat = cam['T_Device_Camera']['UnitQuaternion']
+            qw, qx, qy, qz = quat[0], quat[1][0], quat[1][1], quat[1][2]
+
+            # Calcul unghiuri din Quaternion
+            siny_cosp = 2.0 * (qw * qz + qx * qy)
+            cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz)
+            yaw_val = np.arctan2(siny_cosp, cosy_cosp)
+
+            sinp = 2.0 * (qw * qy - qz * qx)
+            pitch_val = np.arcsin(np.clip(sinp, -1, 1))
+
+            if cam['Label'] == 'camera-slam-left':
+                slam_left_yaw, slam_left_pitch = yaw_val, pitch_val
+            else:
+                rgb_yaw, rgb_pitch = yaw_val, pitch_val
+
+    if slam_left_yaw is not None and rgb_yaw is not None:
+        return rgb_yaw - slam_left_yaw, rgb_pitch - slam_left_pitch
+
+    raise Exception("Eroare: Nu s-au putut găsi parametrii în JSONL.")
+
+
+# =========================
+# 1. SETUP DATE ȘI HARDWARE
+# =========================
 vrs_path = "User_15_Short_10.vrs"
-provider = data_provider.create_vrs_data_provider(vrs_path)
-device_calib = provider.get_device_calibration()
-
-rgb_calib = device_calib.get_camera_calib("camera-rgb") or device_calib.get_camera_calib("device-rgb")
-if rgb_calib is None:
-    raise ValueError("RGB calibration not found")
-
-FX, FY = rgb_calib.get_focal_lengths()
-CX, CY = rgb_calib.get_principal_point()
-f_avg = (FX + FY) / 2
-
+jsonl_path = "online_calibration.jsonl"
 video_input = 'User_15_Short_10.mp4'
 csv_input = 'general_eye_gaze.csv'
-video_output = 'PRECISION.mp4'
+video_output = 'ARIA_GAZE_FINAL_PRO.mp4'
+
+# Calibrare unghiulară automată
+YAW_CORR, PITCH_CORR = get_angular_corrections_from_jsonl(jsonl_path)
+
+# Provider Aria pentru parametrii de proiecție
+provider = data_provider.create_vrs_data_provider(vrs_path)
+device_calib = provider.get_device_calibration()
+rgb_calib = device_calib.get_camera_calib("camera-rgb")
+
+T_device_rgb = device_calib.get_transform_device_sensor("camera-rgb")
+pos_flat = T_device_rgb.translation().flatten()
+
+OFFSET_X, OFFSET_Y = -pos_flat[0], -pos_flat[1]
+FX, FY = rgb_calib.get_focal_lengths()
+CX, CY = rgb_calib.get_principal_point()
+native_size = rgb_calib.get_image_size()
+
+# =========================
+# 2. CONFIGURARE VIDEO
+# =========================
+cap = cv2.VideoCapture(video_input)
+w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+
+# Scalare la rezoluția video (ex: dacă video-ul e 1440p dar senzorul e 2880px)
+s_w, s_h = w / native_size[0], h / native_size[1]
+FXs, FYs, CXs, CYs = FX * s_w, FY * s_h, CX * s_w, CY * s_h
 
 df = pd.read_csv(csv_input)
-cap = cv2.VideoCapture(video_input)
-fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 out = cv2.VideoWriter(video_output, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
 
-smooth_buffer = deque(maxlen=5)
-all_errors = []
-frame_idx = 0
+smooth_buffer = deque(maxlen=3)
 video_start_ts = df['tracking_timestamp_us'].iloc[0]
 
+print(f"\n--- CALIBRARE FINALIZATĂ ---")
+print(f"Offset Unghiular: Yaw={np.rad2deg(YAW_CORR):.2f}°, Pitch={np.rad2deg(PITCH_CORR):.2f}°")
+print(f"Translație HW:    X={OFFSET_X * 1000:.2f}mm, Y={OFFSET_Y * 1000:.2f}mm")
+
+# =========================
+# 3. PROCESARE CADRE
+# =========================
+frame_idx = 0
 while cap.isOpened():
     ret, frame = cap.read()
     if not ret: break
 
+    # Sincronizare timp
     cur_us = (frame_idx / fps) * 1e6 + video_start_ts
-    idx = (df['tracking_timestamp_us'] - cur_us).abs().idxmin()
-    row = df.iloc[idx]
+    row = df.iloc[(df['tracking_timestamp_us'] - cur_us).abs().idxmin()]
 
-    yaw = (row['left_yaw_rads_cpf'] + row['right_yaw_rads_cpf']) / 2
-    pitch = row['pitch_rads_cpf']
+    # Calcul unghiuri cu corecție
+    yaw = (row['left_yaw_rads_cpf'] + row['right_yaw_rads_cpf']) / 2 + YAW_CORR
+    pitch = row['pitch_rads_cpf'] + PITCH_CORR
+    depth = row['depth_m'] if (row['depth_m'] > 0 and not np.isnan(row['depth_m'])) else 1.2
 
-    raw_x = CX + (FX * np.tan(yaw))
-    raw_y = CY - (FY * (np.tan(pitch) / np.cos(yaw)))
+    # Proiecție Pinhole + Paralaxă
+    x_c, y_c = (OFFSET_X / depth) * FXs, (OFFSET_Y / depth) * FYs
+    raw_x = CXs + (FXs * np.tan(yaw)) + x_c
+    raw_y = CYs - (FYs * (np.tan(pitch) / np.cos(yaw))) - y_c
 
-    smooth_buffer.append((raw_x, raw_y))
-    avg_x, avg_y = int(np.mean([p[0] for p in smooth_buffer])), int(np.mean([p[1] for p in smooth_buffer]))
+    if not np.isnan(raw_x) and not np.isnan(raw_y):
+        smooth_buffer.append((raw_x, raw_y))
+        px, py = int(np.mean([p[0] for p in smooth_buffer])), int(np.mean([p[1] for p in smooth_buffer]))
 
-    pixel_error = np.sqrt((raw_x - avg_x) ** 2 + (raw_y - avg_y) ** 2)
-    eroare_grade = np.degrees(np.arctan(pixel_error / f_avg))
-    all_errors.append(eroare_grade)
+        if 0 <= px < w and 0 <= py < h:
+            # --- ELEMENTE GRAFICE ---
+            # 1. Cruce verde (subțire, pentru precizie)
+            cv2.drawMarker(frame, (px, py), (0, 255, 0), cv2.MARKER_CROSS, 30, 2)
 
-    accuracy_percent = max(0, 100 - (eroare_grade * 20))
+            # 2. Contur negru (pentru contrast pe zone albe/luminoase)
+            cv2.circle(frame, (px, py), 12, (0, 0, 0), 2)
 
-    cv2.putText(frame, f"Accuracy: {accuracy_percent:.1f}%", (50, 60),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
-    cv2.putText(frame, f"Error: {eroare_grade:.2f} deg", (50, 100),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1)
-
-    cv2.circle(frame, (avg_x, avg_y), 15, (0, 0, 255), -1)
-    cv2.circle(frame, (avg_x, avg_y), 20, (255, 255, 255), 2)
+            # 3. PUNCT ROȘU MARE (Raza 10, plin)
+            cv2.circle(frame, (px, py), 10, (0, 0, 255), -1)
 
     out.write(frame)
     frame_idx += 1
-
-    if frame_idx % 200 == 0:
-        print(f"Procesat cadru {frame_idx} Accuracy curent: {accuracy_percent:.1f}%")
+    if frame_idx % 1000 == 0: print(f"Procesat frame {frame_idx}...")
 
 cap.release()
 out.release()
-
-print("\n" + "=" * 30)
-print(f"Eroare medie: {np.mean(all_errors):.4f} grade")
-print(f"Accuracy mediu: {max(0, 100 - (np.mean(all_errors) * 20)):.2f}%")
-print(f"Video salvat: {video_output}")
-print("=" * 30)
-#filtered mi-a dat 95% mediu e pentru salturi
+print(f"\nSucces! Rezultat: {video_output}")

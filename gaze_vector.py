@@ -2,123 +2,150 @@ import cv2
 import pandas as pd
 import numpy as np
 from collections import deque
+from projectaria_tools.core import data_provider
+import json
 
+
+def get_yaw_correction_from_jsonl(jsonl_path):
+    """Extract yaw correction from online_calibration.jsonl"""
+    try:
+        with open(jsonl_path, 'r') as f:
+            first_line = f.readline()
+            data = json.loads(first_line)
+
+        # Găsește camera-slam-left și camera-rgb
+        slam_left_yaw = None
+        rgb_yaw = None
+
+        for cam in data['CameraCalibrations']:
+            if cam['Label'] == 'camera-slam-left':
+                quat_data = cam['T_Device_Camera']['UnitQuaternion']
+                qw = quat_data[0]
+                qx, qy, qz = quat_data[1]
+
+                siny_cosp = 2.0 * (qw * qz + qx * qy)
+                cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz)
+                slam_left_yaw = np.arctan2(siny_cosp, cosy_cosp)
+
+            elif cam['Label'] == 'camera-rgb':
+                quat_data = cam['T_Device_Camera']['UnitQuaternion']
+                qw = quat_data[0]
+                qx, qy, qz = quat_data[1]
+
+                siny_cosp = 2.0 * (qw * qz + qx * qy)
+                cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz)
+                rgb_yaw = np.arctan2(siny_cosp, cosy_cosp)
+
+        if slam_left_yaw is not None and rgb_yaw is not None:
+            yaw_correction = rgb_yaw - slam_left_yaw
+            return yaw_correction
+        else:
+            print("Warning: Could not find required cameras in JSONL")
+            return 0.0
+
+    except Exception as e:
+        print(f"Error reading JSONL: {e}")
+        return 0.0
+
+
+# =========================
+# 1. SETUP HARDWARE
+# =========================
+vrs_path = "User_15_Short_10.vrs"
+jsonl_path = "online_calibration.jsonl"
 video_input = 'User_15_Short_10.mp4'
 csv_input = 'general_eye_gaze.csv'
-video_output = 'FINAL_HEATMAP_SCANPATH14.mp4'
+video_output = 'ARIA_GAZE_V2.mp4'
 
-#loading data
+print("Extracting yaw correction from JSONL...")
+YAW_CORRECTION = get_yaw_correction_from_jsonl(jsonl_path)
+print(f"Yaw correction from calibration: {YAW_CORRECTION:.4f} rad ({np.rad2deg(YAW_CORRECTION):.2f}°)")
+
+provider = data_provider.create_vrs_data_provider(vrs_path)
+device_calib = provider.get_device_calibration()
+rgb_calib = device_calib.get_camera_calib("camera-rgb")
+
+# Extragere date SE3 (Aria Gen 2)
+T_device_rgb = device_calib.get_transform_device_sensor("camera-rgb")
+pos_flat = T_device_rgb.translation().flatten()
+
+# Offset geometric
+OFFSET_X_METERS = -pos_flat[0]
+OFFSET_Y_METERS = -pos_flat[1]
+
+# Parametri optici
+FX, FY = rgb_calib.get_focal_lengths()
+CX, CY = rgb_calib.get_principal_point()
+
+# =========================
+# 2. CONFIGURARE VIDEO
+# =========================
+cap = cv2.VideoCapture(video_input)
+if not cap.isOpened():
+    print("Eroare: Nu s-a putut deschide video-ul!")
+    exit()
+
+w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+
+# Scalare automată la rezoluția video
+native_size = rgb_calib.get_image_size()
+s_w, s_h = w / native_size[0], h / native_size[1]
+FX_s, FY_s, CX_s, CY_s = FX * s_w, FY * s_h, CX * s_w, CY * s_h
+
 df = pd.read_csv(csv_input)
+out = cv2.VideoWriter(video_output, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
 
-#video specifications
-cap = cv2.VideoCapture(video_input) #we capture the video and open it in video_imput to process frame by frame
-fps_vid = cap.get(cv2.CAP_PROP_FPS) #we make sure that the processed video has the same speed-fps-as the original
-#we determine the dimension in pixels - openCv resturns a float so we use a wrapper to int
-w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-#param needed: the output, fourcc = four parameter code - for mp4 format, fps, dimension in pixels
-out = cv2.VideoWriter(video_output, cv2.VideoWriter_fourcc(*'mp4v'), fps_vid, (w, h))
+smooth_buffer = deque(maxlen=3)
+video_start_ts = df['tracking_timestamp_us'].iloc[0]
 
-#CALIBRATION & LENS - with manual calibration
-#transforming the coordinates from 2d in 3d
-FISHEYE_FOV_DEG = 125
-PITCH_CORRECTION = 0.165
-YAW_CORRECTION = 0.12
+# =========================
+# 3. LOOP PROCESARE
+# =========================
+print(f"Geometric offset: X={OFFSET_X_METERS * 1000:.2f}mm, Y={OFFSET_Y_METERS * 1000:.2f}mm")
+print(f"Yaw correction: {YAW_CORRECTION:.4f} rad ({np.rad2deg(YAW_CORRECTION):.2f}°)")
+print("Pornire procesare...")
 
-#the optic trajectory is build with the premise that (0,0,0) is equivalent to the center of the video frame
-center_x, center_y = w // 2, h // 2
-diag_px = np.sqrt(w ** 2 + h ** 2)
-f_px = (diag_px / 2) / np.radians(FISHEYE_FOV_DEG / 2)
-
-#heatmap config
-heatmap_accum = np.zeros((h, w), dtype=np.float32)
-
-hm_kernel_size = 80    # Size of the "heat" spot. Larger = blurrier/wider areas.
-hm_sigma = 25          # STD. Higher = smoother edges.
-hm_decay = 0.99        # Temporal decay (0.0 to 1.0)
-hm_intensity = 0.6
-hm_alpha = 0.4         # Transparency of the heatmap overlay
-
-#smoothing - we calculate the average on a queue of 5 frames
-avg_window = 5
-coord_buffer = deque(maxlen=avg_window)
-path_length = 25
-path_history = deque(maxlen=path_length)
-
-alpha_slow = 0.15
-alpha_fast = 0.85 #for adaptive smoothing
-saccade_threshold = 60
-
-#initializing positions
-disp_x, disp_y = float(center_x), float(center_y)
 frame_idx = 0
+while cap.isOpened():
+    ret, frame = cap.read()
+    if not ret: break
 
-try:
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret: break
+    # Sincronizare temporală
+    cur_us = (frame_idx / fps) * 1e6 + video_start_ts
+    idx = (df['tracking_timestamp_us'] - cur_us).abs().idxmin()
+    row = df.iloc[idx]
 
-        #sync CSV to Video
-        cur_us = (frame_idx / fps_vid) * 1e6 + df['tracking_timestamp_us'].iloc[0]
-        row = df.iloc[(df['tracking_timestamp_us'] - cur_us).abs().idxmin()]
+    # Date gaze cu yaw correction din JSONL
+    yaw = (row['left_yaw_rads_cpf'] + row['right_yaw_rads_cpf']) / 2 + YAW_CORRECTION
+    pitch = row['pitch_rads_cpf']
+    depth = row['depth_m'] if (row['depth_m'] > 0 and not np.isnan(row['depth_m'])) else 1.2
 
-        #raw gaze math
-        yaw = ((row['left_yaw_rads_cpf'] + row['right_yaw_rads_cpf']) / 2) + YAW_CORRECTION
-        pitch = row['pitch_rads_cpf'] + PITCH_CORRECTION
+    # Calcul Paralaxă Dinamică
+    x_corr = (OFFSET_X_METERS / depth) * FX_s
+    y_corr = (OFFSET_Y_METERS / depth) * FY_s
 
-        #fisheye Projection
-        cos_theta = np.cos(yaw) * np.cos(pitch)
-        cos_theta = np.clip(cos_theta, -1.0, 1.0)
-        theta = np.arccos(cos_theta)
-        r = f_px * theta
-        phi = np.arctan2(yaw, pitch)
+    # Proiecția (Pinhole Model)
+    raw_x = CX_s + (FX_s * np.tan(yaw)) + x_corr
+    raw_y = CY_s - (FY_s * (np.tan(pitch) / np.cos(yaw))) - y_corr
 
-        raw_x = center_x + (r * np.sin(phi))
-        raw_y = center_y - (r * np.cos(phi))
+    # Smoothing
+    if not np.isnan(raw_x) and not np.isnan(raw_y):
+        smooth_buffer.append((raw_x, raw_y))
+        px = int(np.mean([p[0] for p in smooth_buffer]))
+        py = int(np.mean([p[1] for p in smooth_buffer]))
 
-        #moving average
-        coord_buffer.append((raw_x, raw_y))
-        tgt_x = np.mean([p[0] for p in coord_buffer])
-        tgt_y = np.mean([p[1] for p in coord_buffer])
+        if 0 <= px < w and 0 <= py < h:
+            # Desenăm doar un cerc roșu (fără cruce)
+            cv2.circle(frame, (px, py), 8, (0, 0, 255), -1)  # Cerc roșu plin
+            cv2.circle(frame, (px, py), 12, (0, 0, 255), 2)  # Contur roșu mai mare
 
-        #adaptive smoothing
-        dist = np.sqrt((tgt_x - disp_x) ** 2 + (tgt_y - disp_y) ** 2)
-        alpha = alpha_fast if dist > saccade_threshold else alpha_slow
-        disp_x += (tgt_x - disp_x) * alpha
-        disp_y += (tgt_y - disp_y) * alpha
+    out.write(frame)
+    frame_idx += 1
+    if frame_idx % 500 == 0:
+        print(f"Cadru: {frame_idx}...")
 
-        current_pos = (int(disp_x), int(disp_y))
-        path_history.append(current_pos)
-
-        # 1.Create a single-point heat mask for the current gaze position
-        point_mask = np.zeros((h, w), dtype=np.float32)
-        cv2.circle(point_mask, current_pos, hm_kernel_size // 2, (hm_intensity), -1)
-        point_mask = cv2.GaussianBlur(point_mask, (hm_kernel_size | 1, hm_kernel_size | 1), hm_sigma)
-
-        # 2.Add current heat to the accumulation buffer and apply decay
-        heatmap_accum = cv2.add(heatmap_accum, point_mask)
-        heatmap_accum *= hm_decay
-
-        # 3.Convert accumulation buffer to a visible 8-bit color map
-        heatmap_norm = np.clip(heatmap_accum, 0, 1) * 255
-        heatmap_norm = heatmap_norm.astype(np.uint8)
-        heatmap_color = cv2.applyColorMap(heatmap_norm, cv2.COLORMAP_JET)
-
-        # 4.Blend the heatmap with the original frame
-        frame = cv2.addWeighted(frame, 1.0, heatmap_color, hm_alpha, 0)
-
-        # SCANPATH
-        for i in range(1, len(path_history)):
-            thick = int(max(1, (i / path_length) * 4))
-            cv2.line(frame, path_history[i - 1], path_history[i], (0, 255, 255), thick)
-
-        #draw Current Gaze Point
-        cv2.circle(frame, current_pos, 10, (255, 255, 255), 2)
-        cv2.circle(frame, current_pos, 6, (0, 0, 255), -1)
-
-        out.write(frame)
-        frame_idx += 1
-
-finally:
-    cap.release()
-    out.release()
-    print(f"Process finished. Output saved as: {video_output}")
+cap.release()
+out.release()
+print(f"Gata! Rezultat salvat în {video_output}")
