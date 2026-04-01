@@ -24,7 +24,7 @@ def get_angular_corrections_from_jsonl(jsonl_path):
             quat = cam['T_Device_Camera']['UnitQuaternion']
             qw, qx, qy, qz = quat[0], quat[1][0], quat[1][1], quat[1][2]
 
-            #Quaternion angles
+            # Quaternion angles
             siny_cosp = 2.0 * (qw * qz + qx * qy)
             cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz)
             yaw_val = np.arctan2(siny_cosp, cosy_cosp)
@@ -47,8 +47,7 @@ vrs_path = "User_15_Short_10.vrs"
 jsonl_path = "online_calibration.jsonl"
 video_input = 'User_15_Short_10.mp4'
 csv_input = 'general_eye_gaze.csv'
-video_output = 'ARIA_GAZE_FINAL_PRO.mp4'
-
+video_output = 'Gaze_Vector_ScanPath.mp4'
 
 YAW_CORR, PITCH_CORR = get_angular_corrections_from_jsonl(jsonl_path)
 
@@ -64,7 +63,6 @@ FX, FY = rgb_calib.get_focal_lengths()
 CX, CY = rgb_calib.get_principal_point()
 native_size = rgb_calib.get_image_size()
 
-
 cap = cv2.VideoCapture(video_input)
 w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
@@ -79,6 +77,11 @@ out = cv2.VideoWriter(video_output, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h)
 smooth_buffer = deque(maxlen=3)
 video_start_ts = df['tracking_timestamp_us'].iloc[0]
 
+
+# Scanpath history - stores last N gaze positions for trail visualization
+path_length = 50  # Number of previous points to show in the scanpath
+path_history = deque(maxlen=path_length)
+
 print(f"\nCalibration results:")
 print(f"Offset: Yaw={np.rad2deg(YAW_CORR):.2f}°, Pitch={np.rad2deg(PITCH_CORR):.2f}°")
 print(f"Translation:    X={OFFSET_X * 1000:.2f}mm, Y={OFFSET_Y * 1000:.2f}mm")
@@ -88,7 +91,7 @@ while cap.isOpened():
     ret, frame = cap.read()
     if not ret: break
 
-    #Time sync
+    # Time sync
     cur_us = (frame_idx / fps) * 1e6 + video_start_ts
     row = df.iloc[(df['tracking_timestamp_us'] - cur_us).abs().idxmin()]
 
@@ -106,6 +109,20 @@ while cap.isOpened():
         px, py = int(np.mean([p[0] for p in smooth_buffer])), int(np.mean([p[1] for p in smooth_buffer]))
 
         if 0 <= px < w and 0 <= py < h:
+            current_pos = (px, py)
+            path_history.append(current_pos)
+
+            # Draw scanpath lines) connecting previous gaze points
+            # The thickness fades for older points to show temporal progression
+            for i in range(1, len(path_history)):
+                # Fade thickness: newer points are thicker, older points are thinner
+                thickness = int(max(1, (i / path_length) * 3))
+                # Fade color intensity: newer points are brighter yellow
+                alpha = i / path_length
+                color = (0, int(255 * (1 - alpha * 0.7)), 255)  # Yellow fading to dark yellow
+                cv2.line(frame, path_history[i - 1], path_history[i], color, thickness)
+
+
             cv2.drawMarker(frame, (px, py), (0, 255, 0), cv2.MARKER_CROSS, 30, 2)
             cv2.circle(frame, (px, py), 12, (0, 0, 0), 2)
             cv2.circle(frame, (px, py), 10, (0, 0, 255), -1)
